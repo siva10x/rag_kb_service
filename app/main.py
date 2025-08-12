@@ -1,9 +1,16 @@
+import json
 import tempfile
-from fastapi import FastAPI, Depends, UploadFile, File, Form, Body
+import warnings
+from fastapi import FastAPI, Depends, UploadFile, File, Form, Body, Query, APIRouter
 from typing import Optional
 from .auth import verify_credentials
 from .kb_manager import init_kb_from_docx, search_kb
-from .manifest_store import insert_metrics_row
+from .manifest_store import insert_metrics_row, get_connection
+from datetime import datetime, timedelta
+import pandas as pd
+from evidently.report import Report
+from evidently.metrics import ColumnDriftMetric
+import numpy as np
 
 app = FastAPI(title="Trendora KB Service", version="0.1")
 
@@ -74,6 +81,7 @@ async def log_metrics(
         "source_index_version": "index-20250812-153012"
     }
     """
+    warnings.warn("Metrics logging is enabled. Ensure this is safe for production use.")
     try:
         row = (
             payload.get("timestamp"),
@@ -93,4 +101,72 @@ async def log_metrics(
         insert_metrics_row(row)
         return {"status": "ok", "message": "Metrics logged"}
     except Exception as e:
+        warnings.warn(f"Failed to log metrics: {str(e)}")
         return {"status": "error", "message": str(e)}
+
+@app.post("/metrics/drift-check")
+async def drift_check(username: str = Depends(verify_credentials), debug: bool = False):
+    conn = get_connection()
+
+    now = datetime.utcnow()
+    last_7_days = now - timedelta(days=7)
+    prev_30_days_start = last_7_days - timedelta(days=30)
+
+    recent_df = pd.read_sql_query("""
+        SELECT * FROM metrics
+        WHERE timestamp >= ? AND timestamp < ?
+    """, conn, params=(last_7_days.isoformat(), now.isoformat()))
+
+    baseline_df = pd.read_sql_query("""
+        SELECT * FROM metrics
+        WHERE timestamp >= ? AND timestamp < ?
+    """, conn, params=(prev_30_days_start.isoformat(), last_7_days.isoformat()))
+
+    conn.close()
+
+    if baseline_df.empty or recent_df.empty:
+        return {"status": "error", "message": "Not enough data"}
+
+    # Only check drift for these columns
+    columns_to_check = ["embedding_mean_sim", "embedding_max_sim"]
+
+    # Build report with column-level drift metrics
+    metrics = [ColumnDriftMetric(column_name=col) for col in columns_to_check]
+    report = Report(metrics=metrics)
+    report.run(reference_data=baseline_df, current_data=recent_df)
+    result_dict = report.as_dict()
+
+    if debug:
+        print(json.dumps(result_dict, indent=2))
+
+    drift_results = {}
+    drift_scores = []
+
+    for m in result_dict.get("metrics", []):
+        res = m.get("result", {})
+        col = res.get("column_name")  # FIX: column_name is in result, not metric
+        if col and col in columns_to_check:
+            safe_result = {
+                "drift_detected": bool(res.get("drift_detected", False)),
+                "drift_score": float(res.get("drift_score", 0.0)),
+                "stattest_name": str(res.get("stattest_name", "")),
+            }
+            drift_results[col] = safe_result
+            drift_scores.append(safe_result["drift_score"])
+
+
+    drift_score_avg = float(np.mean(drift_scores)) if drift_scores else None
+    drift_score_threshold = 0.3
+    retrain_recommended = drift_score_avg is not None and drift_score_avg > drift_score_threshold
+    drift_detected = any(v["drift_detected"] for v in drift_results.values())
+
+    return {
+        "status": "ok",
+        "drift_detected": drift_detected,
+        "retrain_recommended": retrain_recommended,
+        "drift_score_avg": drift_score_avg,
+        "details": drift_results,
+        "baseline_count": len(baseline_df),
+        "recent_count": len(recent_df),
+        "drift_score_threshold": drift_score_threshold
+    }
