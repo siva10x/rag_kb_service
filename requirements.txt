@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+chromadb
+openai
+tiktoken
+python-docx
+sqlite-utils
+pydantic
+python-dotenv
